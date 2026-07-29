@@ -12,6 +12,7 @@
     "bcrypt": "^5.1.1",
     "bull": "^4.16.5",
     "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
     "express": "^4.22.1",
     "firebase-admin": "^13.7.0",
     "ioredis": "^5.10.1",

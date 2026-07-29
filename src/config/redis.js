@@ -16,4 +16,4 @@ function getRedis() {
   return redis; // may be undefined if Redis is down — callers should check
 }
 
-module.exports = { connectRedis, getRedis };
+module.exports = { connectRedis, getRedis };ls

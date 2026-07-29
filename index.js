@@ -11,14 +11,16 @@ const fs = require("fs");
 const Redis = require("ioredis");
 const axios = require("axios");          // ✅ FIX 1: moved to top
 
+const CONFIG = require("./src/config/index.js");
+
 // ================= CONFIG =================
-const CONFIG = {
-  PORT: 3000,
-  BASE_URL: "http://192.168.1.6:3000",     // 🔥 CHANGE THIS
-  JWT_SECRET: "secret",
-  LARAVEL_API: "https://bookmyteacher.cloud/api/user",  // ✅ FIX 2: single source of truth
-  DB: { host: "localhost", user: "root", password: "", database: "chatBMT3" }
-};
+// const CONFIG = {
+//   PORT: 3000,
+//   BASE_URL: "http://192.168.1.6:3000",     // 🔥 CHANGE THIS
+//   JWT_SECRET: "secret",
+//   LARAVEL_API: "https://bookmyteacher.cloud/api/user",  // ✅ FIX 2: single source of truth
+//   DB: { host: "localhost", user: "root", password: "", database: "chatBMT3" }
+// };
 // const CONFIG = {
 //   PORT: 3000,
 //   BASE_URL: "https://communication.bookmyteacher.cloud",     // 🔥 CHANGE THIS
