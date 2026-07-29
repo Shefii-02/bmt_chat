@@ -20,7 +20,7 @@ const fs = require('fs');
 // ─────────────────────────────────────────────
 const CONFIG = {
   PORT: process.env.PORT || 3000,
-  BASE_URL: process.env.BASE_URL || 'http://192.168.29.145:3000',
+  BASE_URL: process.env.BASE_URL || 'http://192.168.1.5:3000',
   JWT_SECRET: process.env.JWT_SECRET || 'bookmyteacher_secret_2025',
 
   DB_HOST: process.env.DB_HOST || 'localhost',

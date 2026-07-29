@@ -1,23 +1,25 @@
-// const http = require('http');
-// const app = require('./app');
-// const { initSocket } = require('./config/socket');
-// require('dotenv').config();
-
-// const server = http.createServer(app);
-
-// initSocket(server);
-
-// const PORT = process.env.PORT || 4000;
-// server.listen(PORT, () => {
-//   console.log(`Server running on port ${PORT}`);
-// });
 const http = require("http");
-const app = require("./app");
-const { initSocket } = require("./config/socket");
+const socketIO = require("socket.io");
+
+const app = require("./src/app");
+const CONFIG = require("./src/config");
+const { connectDB } = require("./src/config/database");
+const { connectRedis } = require("./src/config/redis");
+const initSocket = require("./src/sockets");
 
 const server = http.createServer(app);
-initSocket(server);
+const io = socketIO(server, { cors: { origin: "*" } });
 
-server.listen(3000, () =>
-  console.log("Chat server running on port 3000")
-);
+(async () => {
+  // ── Connect services ─────────────────────────────────────────
+  await connectDB();
+  connectRedis();
+
+  // ── Attach Socket.IO ─────────────────────────────────────────
+  initSocket(io);
+
+  // ── Start listening ───────────────────────────────────────────
+  server.listen(CONFIG.PORT, "0.0.0.0", () => {
+    console.log(`🚀 Running: ${CONFIG.BASE_URL}`);
+  });
+})();

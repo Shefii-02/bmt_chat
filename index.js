@@ -14,11 +14,18 @@ const axios = require("axios");          // ✅ FIX 1: moved to top
 // ================= CONFIG =================
 const CONFIG = {
   PORT: 3000,
-  BASE_URL: "http://192.168.1.50:3000",     // 🔥 CHANGE THIS
+  BASE_URL: "http://192.168.1.6:3000",     // 🔥 CHANGE THIS
   JWT_SECRET: "secret",
-  LARAVEL_API: "https://www.bookmyteacher.cloud/api/user",  // ✅ FIX 2: single source of truth
+  LARAVEL_API: "https://bookmyteacher.cloud/api/user",  // ✅ FIX 2: single source of truth
   DB: { host: "localhost", user: "root", password: "", database: "chatBMT3" }
 };
+// const CONFIG = {
+//   PORT: 3000,
+//   BASE_URL: "https://communication.bookmyteacher.cloud",     // 🔥 CHANGE THIS
+//   JWT_SECRET: "secret",
+//   LARAVEL_API: "https://www.bookmyteacher.cloud/api/user",  // ✅ FIX 2: single source of truth
+//   DB: { host: "localhost", user: "cloudUserChat", password: "chatBMT@002!", database: "chatBMT" }
+// };
 
 // ================= INIT =================
 const app = express();
@@ -254,69 +261,151 @@ app.post("/api/upload", upload.single("file"), (req, res) => {
     size: req.file.size,
   });
 });
+// app.get("/api/chat/conversations", auth, async (req, res) => {
+//   const userId = req.user.data.id;
+
+//   const [rows] = await db.query(`
+//     SELECT
+//       c.id,
+//       c.name,
+//       c.type,
+//       c.avatar_url,
+
+//       m.id            AS last_message_id,
+//       m.content       AS last_message,
+//       m.message_type  AS last_message_type,
+//       m.created_at    AS last_message_time,
+//       m.sender_id     AS last_sender_id,
+
+//       -- ✅ unread count
+//       COUNT(CASE 
+//         WHEN m2.sender_id != ? AND mr.id IS NULL THEN 1 
+//       END) AS unread_count,
+
+//       -- other user (direct chat)
+//       u.user_id    AS other_user_id,
+//       u.name       AS other_user_name,
+//       u.avatar_url AS other_user_avatar,
+//       u.is_online  AS other_user_online,
+//       u.last_seen  AS other_user_last_seen,
+//       u.role AS acc_type
+
+//     FROM conversation_members cm
+//     JOIN conversations c ON c.id = cm.conversation_id
+
+//     -- ✅ last message (FAST)
+//     LEFT JOIN messages m 
+//       ON m.id = (
+//         SELECT id FROM messages 
+//         WHERE conversation_id = c.id 
+//         ORDER BY id DESC LIMIT 1
+//       )
+
+//     -- ✅ unread calculation
+//     LEFT JOIN messages m2 
+//       ON m2.conversation_id = c.id
+
+//     LEFT JOIN message_reads mr 
+//       ON mr.message_id = m2.id AND mr.user_id = ?
+
+//     -- other user join
+//     LEFT JOIN conversation_members cm2
+//       ON cm2.conversation_id = c.id 
+//       AND cm2.user_id != ? 
+//       AND c.type = 'direct'
+
+//     LEFT JOIN users u ON u.user_id = cm2.user_id
+
+//     WHERE cm.user_id = ?
+
+//     GROUP BY c.id
+
+//     ORDER BY last_message_time DESC
+//   `, [userId, userId, userId, userId]);
+
+//   res.json(rows);
+// });
+
 app.get("/api/chat/conversations", auth, async (req, res) => {
-  const userId = req.user.data.id;
+  try {
+    const userId = req.user.data.id;
+    const [rows] = await db.query(`
+      SELECT
+          c.id,
+          c.name,
+          c.type,
+          c.avatar_url,
 
-  const [rows] = await db.query(`
-    SELECT
-      c.id,
-      c.name,
-      c.type,
-      c.avatar_url,
+          -- Last message
+          m.id            AS last_message_id,
+          m.content       AS last_message,
+          m.message_type  AS last_message_type,
+          m.created_at    AS last_message_time,
+          m.sender_id     AS last_sender_id,
 
-      m.id            AS last_message_id,
-      m.content       AS last_message,
-      m.message_type  AS last_message_type,
-      m.created_at    AS last_message_time,
-      m.sender_id     AS last_sender_id,
+          -- UNREAD COUNT (0 sent,1 delivered = unread | 2 seen = read)
+          (
+            SELECT COUNT(*)
+            FROM message_reads mr
+            JOIN messages mx
+              ON mx.id = mr.message_id
+            WHERE mx.conversation_id = c.id
+              AND mx.sender_id != ?
+              AND mr.user_id = ?
+              AND mr.status < 2
+          ) AS unread_count,
 
-      -- ✅ unread count
-      COUNT(CASE 
-        WHEN m2.sender_id != ? AND mr.id IS NULL THEN 1 
-      END) AS unread_count,
+          -- Other user details (for direct chat)
+          u.user_id       AS other_user_id,
+          u.name          AS other_user_name,
+          u.avatar_url    AS other_user_avatar,
+          u.is_online     AS other_user_online,
+          u.last_seen     AS other_user_last_seen,
+          u.role          AS acc_type
 
-      -- other user (direct chat)
-      u.user_id    AS other_user_id,
-      u.name       AS other_user_name,
-      u.avatar_url AS other_user_avatar,
-      u.is_online  AS other_user_online,
-      u.last_seen  AS other_user_last_seen,
-      u.role AS acc_type
+      FROM conversation_members cm
 
-    FROM conversation_members cm
-    JOIN conversations c ON c.id = cm.conversation_id
+      JOIN conversations c
+        ON c.id = cm.conversation_id
 
-    -- ✅ last message (FAST)
-    LEFT JOIN messages m 
+      -- Latest message per conversation
+      LEFT JOIN messages m
       ON m.id = (
-        SELECT id FROM messages 
-        WHERE conversation_id = c.id 
-        ORDER BY id DESC LIMIT 1
+          SELECT id
+          FROM messages
+          WHERE conversation_id = c.id
+          ORDER BY id DESC
+          LIMIT 1
       )
 
-    -- ✅ unread calculation
-    LEFT JOIN messages m2 
-      ON m2.conversation_id = c.id
+      -- Direct chat other user
+      LEFT JOIN conversation_members cm2
+        ON cm2.conversation_id = c.id
+       AND cm2.user_id != ?
+       AND c.type='direct'
 
-    LEFT JOIN message_reads mr 
-      ON mr.message_id = m2.id AND mr.user_id = ?
+      LEFT JOIN users u
+        ON u.user_id = cm2.user_id
 
-    -- other user join
-    LEFT JOIN conversation_members cm2
-      ON cm2.conversation_id = c.id 
-      AND cm2.user_id != ? 
-      AND c.type = 'direct'
+      WHERE cm.user_id = ?
 
-    LEFT JOIN users u ON u.user_id = cm2.user_id
+      ORDER BY
+        m.created_at DESC,
+        c.id DESC
+    `, [userId, userId, userId, userId]);
 
-    WHERE cm.user_id = ?
+    res.json(rows);
 
-    GROUP BY c.id
+  } catch (err) {
 
-    ORDER BY last_message_time DESC
-  `, [userId, userId, userId, userId]);
+    console.error("Conversation list error:", err.message);
 
-  res.json(rows);
+    res.status(500).json({
+      error: "Failed to load conversations"
+    });
+
+  }
+
 });
 
 // ================= MESSAGES (paginated) =================
@@ -332,6 +421,7 @@ app.get("/api/chat/messages/:id", auth, async (req, res) => {
      LIMIT ? OFFSET ?`,
     [req.params.id, limit, offset]
   );
+
 
   res.json(msgs);
 });
@@ -407,8 +497,20 @@ io.on("connection", async (socket) => {
   socket.broadcast.emit("user_status", { userId, isOnline: true });
 
   // ✅ join a conversation room (called by Flutter when entering chat screen)
-  socket.on("join", (cid) => {
+  socket.on("join", async (cid) => {
     socket.join("conv_" + cid);
+
+    await db.query(
+      `
+ UPDATE message_reads
+ SET status=1,
+     updated_at=NOW()
+ WHERE conversation_id=?
+ AND user_id=?
+ AND status=0
+ `,
+      [cid, userId]
+    );
     console.log(`[Socket] User ${userId} joined conv_${cid}`);
   });
 
@@ -434,6 +536,37 @@ io.on("connection", async (socket) => {
           data.durationSec ?? null,
         ]
       );
+
+
+     const messageId = r.insertId;
+
+      const [members] = await db.query(
+        `SELECT user_id
+ FROM conversation_members
+ WHERE conversation_id = ?
+ AND user_id != ?`,
+        [data.conversationId, userId]
+      );
+
+      console.log(members);
+
+      for (const member of members) {
+
+      const  msR =   await  db.query(
+          `INSERT INTO message_reads
+ (message_id, conversation_id, user_id, status, created_at, updated_at)
+ VALUES (?, ?, ?, 0, NOW(), NOW())`,
+          [
+            messageId,
+            data.conversationId,
+            member.user_id
+          ]
+        );
+
+        console.log(msR);
+
+      }
+
 
       const msg = {
         id: r.insertId,
@@ -487,13 +620,32 @@ io.on("connection", async (socket) => {
       [conversationId, userId]
     );
 
-    if (updated.affectedRows > 0) {
-      // Tell the other side their messages were read
-      socket.to("conv_" + conversationId).emit("messages_read", {
-        conversationId,
-        userId,
-      });
-    }
+    await db.query(
+      `
+ UPDATE message_reads
+ SET status=2,
+ read_at=NOW(),
+ updated_at=NOW()
+ WHERE conversation_id=?
+ AND user_id=?
+ AND status < 2
+ `,
+      [conversationId, userId]
+    );
+
+    // socket.to("conv_" + conversationId)
+    //   .emit("messages_read", {
+    //     conversationId,
+    //     userId
+    //   });
+
+    // if (updated.affectedRows > 0) {
+    // Tell the other side their messages were read
+    socket.to("conv_" + conversationId).emit("messages_read", {
+      conversationId,
+      userId,
+    });
+    // }
   });
 
   socket.on("disconnect", async () => {
