@@ -1,0 +1,30 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Uploads (user files — don't version these)
+uploads/
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# PM2
+.pm2/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Nodemon
+.nodemon-debug.log
