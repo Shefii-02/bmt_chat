@@ -377,6 +377,7 @@ app.get("/api/chat/conversations", auth, async (req, res) => {
           SELECT id
           FROM messages
           WHERE conversation_id = c.id
+            ${HAS_CLEARED ? "AND (cm.cleared_at IS NULL OR created_at > cm.cleared_at)" : ""}
           ORDER BY id DESC
           LIMIT 1
       )
@@ -417,16 +418,66 @@ app.get("/api/chat/messages/:id", auth, async (req, res) => {
   const limit = parseInt(req.query.limit ?? "30", 10);
   const offset = parseInt(req.query.offset ?? "0", 10);
 
+  const userId = req.user.data.id;
+
+  // "Clear chat" hides older messages for this member only
+  let sinceSql = "";
+  const params = [req.params.id];
+  if (HAS_CLEARED) {
+    const [[row]] = await db.query(
+      "SELECT cleared_at FROM conversation_members WHERE conversation_id = ? AND user_id = ?", [req.params.id, userId]);
+    if (row?.cleared_at) { sinceSql = "AND created_at > ?"; params.push(row.cleared_at); }
+  }
+
   const [msgs] = await db.query(
     `SELECT * FROM messages
-     WHERE conversation_id = ?
+     WHERE conversation_id = ? ${sinceSql}
      ORDER BY id DESC
      LIMIT ? OFFSET ?`,
-    [req.params.id, limit, offset]
+    [...params, limit, offset]
   );
 
+  // Attach poll data (options, counts, my votes) to poll messages
+  if (HAS_POLLS) {
+    const polls = await pollPayloads(msgs.map((m) => m.poll_id), userId);
+    for (const m of msgs) if (m.poll_id && polls[m.poll_id]) m.poll = polls[m.poll_id];
+  }
 
   res.json(msgs);
+});
+
+// ================= POLL RESPONSES (who voted for what) =================
+// Only for accounts with the admin's "See everyone's poll responses" permission.
+app.get("/api/chat/poll/:id/responses", auth, async (req, res) => {
+  if (!HAS_POLLS) return res.status(404).json({ error: "Polls are not enabled yet." });
+
+  const [[poll]] = await db.query("SELECT id, conversation_id, question FROM chat_polls WHERE id = ?", [req.params.id]);
+  if (!poll) return res.status(404).json({ error: "Poll not found." });
+
+  const userId = req.user.data.id;
+  const [[member]] = await db.query(
+    "SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id = ?", [poll.conversation_id, userId]);
+  if (!member) return res.status(403).json({ error: "You are not in this conversation." });
+
+  const perms = await permsForAuthHeader(req.headers.authorization, poll.conversation_id);
+  if (perms && perms.can?.poll_view_results === false) {
+    return res.status(403).json({ error: "You are not allowed to see poll responses in this chat." });
+  }
+
+  const [rows] = await db.query(
+    `SELECT o.id AS option_id, o.text, v.user_id, u.name
+       FROM chat_poll_options o
+       LEFT JOIN chat_poll_votes v ON v.option_id = o.id
+       LEFT JOIN users u ON u.user_id = v.user_id
+      WHERE o.poll_id = ? ORDER BY o.position, o.id, v.id`, [poll.id]);
+
+  const options = [];
+  for (const r of rows) {
+    let o = options.find((x) => x.id === r.option_id);
+    if (!o) { o = { id: r.option_id, text: r.text, voters: [] }; options.push(o); }
+    if (r.user_id) o.voters.push({ user_id: r.user_id, name: r.name ?? "User" });
+  }
+  res.json({ id: poll.id, question: poll.question, options });
 });
 
 // ================= CREATE DIRECT CHAT =================
@@ -449,6 +500,18 @@ app.post("/api/chat/create", auth, async (req, res) => {
 
   if (existing.length > 0) {
     return res.json({ conversationId: existing[0].id, existing: true });
+  }
+
+  // Starting a NEW individual chat needs the admin's "Start individual chats" permission
+  try {
+    const p = await axios.post(PERMISSIONS_URL, {}, {
+      headers: { Authorization: req.headers.authorization }, timeout: 4000,
+    });
+    if (p.data?.data?.can?.direct_chat_create === false) {
+      return res.status(403).json({ error: "You are not allowed to start individual chats." });
+    }
+  } catch (e) {
+    console.log("[create chat] permissions unavailable, allowing:", e.message);
   }
 
   const [r] = await db.query(
@@ -491,23 +554,79 @@ async function chatPermissions(socket, conversationId) {
   }
 }
 
-// text | voice | media — which permission a message needs
-function capabilityFor(messageType) {
+// Which admin-set permission a message needs. `source` is 'camera' for photos/videos captured in the app.
+function capabilityFor(messageType, source) {
   const t = String(messageType || "text").toLowerCase();
-  if (t === "text") return "text";
-  if (t === "voice" || t === "audio") return "voice";
-  if (t === "poll") return "poll_create";
-  return "media";
+  const camera = String(source || "").toLowerCase() === "camera";
+  switch (t) {
+    case "text":  return "text";
+    case "voice": return "voice_message";
+    case "audio": return "audio_share";
+    case "image": return camera ? "capture_image" : "image_share";
+    case "video": return camera ? "capture_video" : "video_share";
+    case "poll":  return "poll_create";
+    default:      return "document_share";   // pdf, docx, other attachments
+  }
 }
 
-// Do the reply_to_id / mentions columns exist yet (admin migration run)?
-let HAS_CHAT_COLS = false;
+const CAPABILITY_LABELS = {
+  text: "send text messages",
+  voice_message: "send voice messages",
+  audio_share: "share audio files",
+  image_share: "share photos",
+  capture_image: "capture and share photos",
+  video_share: "share videos",
+  capture_video: "capture and share videos",
+  document_share: "share attachments",
+  poll_create: "create polls",
+};
+
+// Which optional columns/tables exist yet (the Laravel chat migrations may not have run)
+let HAS_CHAT_COLS = false;   // messages.reply_to_id / mentions
+let HAS_CLEARED   = false;   // conversation_members.cleared_at
+let HAS_POLLS     = false;   // chat_polls tables + messages.poll_id
 async function detectChatColumns() {
+  const has = async (sql) => { try { const [r] = await db.query(sql); return r.length > 0; } catch { return false; } };
+  HAS_CHAT_COLS = await has("SHOW COLUMNS FROM messages LIKE 'reply_to_id'");
+  HAS_CLEARED   = await has("SHOW COLUMNS FROM conversation_members LIKE 'cleared_at'");
+  HAS_POLLS     = (await has("SHOW COLUMNS FROM messages LIKE 'poll_id'")) && (await has("SHOW TABLES LIKE 'chat_polls'"));
+  console.log("Chat columns — replies/mentions:", HAS_CHAT_COLS, "| clear chat:", HAS_CLEARED, "| polls:", HAS_POLLS);
+}
+
+// Permissions for an arbitrary request (REST): same answer the socket uses, never cached.
+async function permsForAuthHeader(authHeader, conversationId) {
   try {
-    const [rows] = await db.query("SHOW COLUMNS FROM messages LIKE 'reply_to_id'");
-    HAS_CHAT_COLS = rows.length > 0;
-  } catch { HAS_CHAT_COLS = false; }
-  console.log("Chat reply/mention columns:", HAS_CHAT_COLS ? "present" : "missing (run the Laravel chat migration)");
+    const res = await axios.post(PERMISSIONS_URL, conversationId ? { conversation_id: conversationId } : {},
+      { headers: { Authorization: authHeader }, timeout: 4000 });
+    return res.data?.data ?? null;
+  } catch (err) {
+    if (err.response?.status === 403) return { denied: true };
+    return null;   // Laravel unreachable -> fail open
+  }
+}
+
+// Poll objects for the given poll ids: counts per option + this user's own votes
+async function pollPayloads(pollIds, userId) {
+  const ids = [...new Set(pollIds.filter(Boolean))];
+  if (!ids.length || !HAS_POLLS) return {};
+
+  const [polls]   = await db.query("SELECT id, conversation_id, question, multiple FROM chat_polls WHERE id IN (?)", [ids]);
+  const [options] = await db.query(
+    `SELECT o.id, o.poll_id, o.text, COUNT(v.id) AS votes
+       FROM chat_poll_options o LEFT JOIN chat_poll_votes v ON v.option_id = o.id
+      WHERE o.poll_id IN (?) GROUP BY o.id ORDER BY o.position, o.id`, [ids]);
+  const [mine] = await db.query("SELECT poll_id, option_id FROM chat_poll_votes WHERE poll_id IN (?) AND user_id = ?", [ids, userId]);
+
+  const out = {};
+  for (const p of polls) {
+    const opts = options.filter((o) => o.poll_id === p.id).map((o) => ({ id: o.id, text: o.text, votes: Number(o.votes) }));
+    out[p.id] = {
+      id: p.id, conversation_id: p.conversation_id, question: p.question, multiple: !!p.multiple,
+      options: opts, total_votes: opts.reduce((n, o) => n + o.votes, 0),
+      my_option_ids: mine.filter((m) => m.poll_id === p.id).map((m) => m.option_id),
+    };
+  }
+  return out;
 }
 
 // ================= SOCKET AUTH =================
@@ -583,11 +702,10 @@ io.on("connection", async (socket) => {
       let replyToId = data.replyToId ? Number(data.replyToId) : null;
 
       if (perms) {
-        const need = capabilityFor(data.messageType);
-        const labels = { text: "send text messages", voice: "send voice messages", media: "share media or files", poll_create: "create polls" };
-        if (!perms.can?.[need]) return reject(`You are not allowed to ${labels[need]} in this chat.`);
-        if (replyToId && !perms.can?.reply) return reject("Replying is turned off in this chat.");
-        if (mentions.length && !perms.can?.mention) return reject("Mentions are turned off in this chat.");
+        const need = capabilityFor(data.messageType, data.source);
+        if (perms.can?.[need] === false) return reject(`You are not allowed to ${CAPABILITY_LABELS[need] ?? "do this"} in this chat.`);
+        if (replyToId && perms.can?.reply === false) return reject("Replying is turned off in this chat.");
+        if (mentions.length && perms.can?.mention === false) return reject("Mentions are turned off in this chat.");
 
         const maxBytes = (perms.max_file_mb ?? 20) * 1024 * 1024;
         if (data.fileSize && Number(data.fileSize) > maxBytes) return reject(`Files must be under ${perms.max_file_mb} MB.`);
@@ -684,6 +802,106 @@ io.on("connection", async (socket) => {
     } catch (err) {
       console.error("[send_message] error:", err.message);
       if (typeof ack === "function") ack({ ok: false, error: err.message });
+    }
+  });
+
+  // ---- Polls ----
+  socket.on("create_poll", async (data, ack) => {
+    const done = (r) => { if (typeof ack === "function") ack(r); };
+    try {
+      if (!HAS_POLLS) return done({ ok: false, error: "Polls are not enabled yet." });
+
+      const cid = Number(data.conversationId);
+      const question = String(data.question ?? "").trim().slice(0, 300);
+      const options = (Array.isArray(data.options) ? data.options : [])
+        .map((o) => String(o ?? "").trim().slice(0, 120)).filter(Boolean);
+
+      if (!question) return done({ ok: false, error: "A poll needs a question." });
+      if (options.length < 2 || options.length > 10) return done({ ok: false, error: "A poll needs 2 to 10 options." });
+
+      const perms = await chatPermissions(socket, cid);
+      if (perms?.denied) return done({ ok: false, error: "You are not in this conversation." });
+      if (perms && perms.can?.poll_create === false) {
+        socket.emit("message_denied", { conversationId: cid, error: "You are not allowed to create polls in this chat." });
+        return done({ ok: false, code: "not_allowed", error: "You are not allowed to create polls in this chat." });
+      }
+
+      const [[member]] = await db.query("SELECT user_id FROM conversation_members WHERE conversation_id=? AND user_id=?", [cid, userId]);
+      if (!member) return done({ ok: false, error: "You are not in this conversation." });
+
+      const [pr] = await db.query(
+        "INSERT INTO chat_polls (conversation_id, created_by, question, multiple, created_at, updated_at) VALUES (?, ?, ?, ?, NOW(), NOW())",
+        [cid, userId, question, data.multiple ? 1 : 0]);
+      const pollId = pr.insertId;
+
+      for (let i = 0; i < options.length; i++) {
+        await db.query("INSERT INTO chat_poll_options (poll_id, text, position) VALUES (?, ?, ?)", [pollId, options[i], i]);
+      }
+
+      const [mr] = await db.query(
+        "INSERT INTO messages (conversation_id, sender_id, content, message_type, poll_id) VALUES (?, ?, ?, 'poll', ?)",
+        [cid, userId, question, pollId]);
+
+      const [members] = await db.query("SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id != ?", [cid, userId]);
+      for (const m of members) {
+        await db.query(
+          "INSERT INTO message_reads (message_id, conversation_id, user_id, status, created_at, updated_at) VALUES (?, ?, ?, 0, NOW(), NOW())",
+          [mr.insertId, cid, m.user_id]);
+      }
+
+      const poll = (await pollPayloads([pollId], userId))[pollId];
+      const msg = {
+        id: mr.insertId, conversation_id: cid, sender_id: userId, content: question, message_type: "poll",
+        poll_id: pollId, poll: { ...poll, my_option_ids: [] },   // everyone starts with no vote
+        status: "sent", created_at: new Date().toISOString(),
+      };
+      io.to("conv_" + cid).emit("new_message", msg);
+      done({ ok: true, messageId: mr.insertId, pollId });
+    } catch (err) {
+      console.error("[create_poll] error:", err.message);
+      done({ ok: false, error: err.message });
+    }
+  });
+
+  socket.on("vote_poll", async (data, ack) => {
+    const done = (r) => { if (typeof ack === "function") ack(r); };
+    try {
+      if (!HAS_POLLS) return done({ ok: false, error: "Polls are not enabled yet." });
+
+      const pollId = Number(data.pollId);
+      const [[poll]] = await db.query("SELECT id, conversation_id, multiple FROM chat_polls WHERE id = ?", [pollId]);
+      if (!poll) return done({ ok: false, error: "Poll not found." });
+
+      const [[member]] = await db.query(
+        "SELECT user_id FROM conversation_members WHERE conversation_id=? AND user_id=?", [poll.conversation_id, userId]);
+      if (!member) return done({ ok: false, error: "You are not in this conversation." });
+
+      const perms = await chatPermissions(socket, poll.conversation_id);
+      if (perms && perms.can?.poll_vote === false) {
+        return done({ ok: false, code: "not_allowed", error: "You are not allowed to vote in polls in this chat." });
+      }
+
+      // only options that belong to this poll; single-choice polls keep one
+      let optionIds = (Array.isArray(data.optionIds) ? data.optionIds : []).map(Number);
+      const [valid] = await db.query("SELECT id FROM chat_poll_options WHERE poll_id = ? AND id IN (?)", [pollId, optionIds.length ? optionIds : [0]]);
+      optionIds = valid.map((o) => o.id);
+      if (!poll.multiple) optionIds = optionIds.slice(0, 1);
+
+      await db.query("DELETE FROM chat_poll_votes WHERE poll_id = ? AND user_id = ?", [pollId, userId]);
+      for (const oid of optionIds) {
+        await db.query("INSERT INTO chat_poll_votes (poll_id, option_id, user_id) VALUES (?, ?, ?)", [pollId, oid, userId]);
+      }
+
+      // counts only — who voted is shared through the permission-checked responses endpoint
+      const fresh = (await pollPayloads([pollId], userId))[pollId];
+      io.to("conv_" + poll.conversation_id).emit("poll_updated", {
+        conversationId: poll.conversation_id, pollId,
+        options: fresh.options.map((o) => ({ id: o.id, votes: o.votes })), total_votes: fresh.total_votes,
+      });
+      done({ ok: true, my_option_ids: fresh.my_option_ids });
+    } catch (err) {
+      console.error("[vote_poll] error:", err.message);
+      done({ ok: false, error: err.message });
     }
   });
 
