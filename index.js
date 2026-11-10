@@ -222,6 +222,7 @@ async function runSchema() {
   // `);
 
   console.log("✅ DB Ready");
+  await detectChatColumns();
 }
 
 // ================= AUTH MIDDLEWARE =================
@@ -463,6 +464,52 @@ app.post("/api/chat/create", auth, async (req, res) => {
   res.json({ conversationId: cid, existing: false });
 });
 
+// ================= CHAT PERMISSIONS (set by the admin in Laravel) =================
+// Laravel is the single source of truth: POST {api}/chat/permissions answers what this user may do in a conversation.
+// Answers are cached for 30s. If Laravel can't be reached we FAIL OPEN so chat keeps working.
+const PERMISSIONS_URL = (CONFIG.LARAVEL_API || "").replace(/\/user\/?$/, "") + "/chat/permissions";
+const permCache = new Map();
+
+async function chatPermissions(socket, conversationId) {
+  const key = `${socket.user.data.id}:${conversationId}`;
+  const hit = permCache.get(key);
+  if (hit && Date.now() - hit.at < 30000) return hit.data;
+
+  try {
+    const res = await axios.post(
+      PERMISSIONS_URL,
+      { conversation_id: conversationId },
+      { headers: { Authorization: `Bearer ${socket.handshake.auth.token}` }, timeout: 4000 }
+    );
+    const data = res.data?.data ?? null;
+    permCache.set(key, { at: Date.now(), data });
+    return data;
+  } catch (err) {
+    if (err.response?.status === 403) return { denied: true };   // not a member of this conversation
+    console.log("[permissions] unavailable, allowing:", err.message);
+    return null;
+  }
+}
+
+// text | voice | media — which permission a message needs
+function capabilityFor(messageType) {
+  const t = String(messageType || "text").toLowerCase();
+  if (t === "text") return "text";
+  if (t === "voice" || t === "audio") return "voice";
+  if (t === "poll") return "poll_create";
+  return "media";
+}
+
+// Do the reply_to_id / mentions columns exist yet (admin migration run)?
+let HAS_CHAT_COLS = false;
+async function detectChatColumns() {
+  try {
+    const [rows] = await db.query("SHOW COLUMNS FROM messages LIKE 'reply_to_id'");
+    HAS_CHAT_COLS = rows.length > 0;
+  } catch { HAS_CHAT_COLS = false; }
+  console.log("Chat reply/mention columns:", HAS_CHAT_COLS ? "present" : "missing (run the Laravel chat migration)");
+}
+
 // ================= SOCKET AUTH =================
 // ✅ FIX 2: uses CONFIG.LARAVEL_API — same URL as REST
 io.use(async (socket, next) => {
@@ -523,21 +570,63 @@ io.on("connection", async (socket) => {
     console.log("DATA:", data);               // see what Flutter sends
     console.log("USER ID:", socket.user.data?.id); // is this correct?
     try {
-      const [r] = await db.query(
-        `INSERT INTO messages
-           (conversation_id, sender_id, content, message_type, file_url, file_name, file_size, duration_sec)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          data.conversationId,
-          userId,                                   // always from verified socket user
-          data.content ?? null,
-          data.messageType ?? "text",
-          data.fileUrl ?? null,
-          data.fileName ?? null,
-          data.fileSize ?? null,
-          data.durationSec ?? null,
-        ]
-      );
+      // ---- admin-controlled permissions ----
+      const reject = (error) => {
+        socket.emit("message_denied", { conversationId: data.conversationId, error });
+        if (typeof ack === "function") ack({ ok: false, code: "not_allowed", error });
+      };
+
+      const perms = await chatPermissions(socket, data.conversationId);
+      if (perms?.denied) return reject("You are not in this conversation.");
+
+      let mentions = Array.isArray(data.mentions) ? data.mentions.map(Number).filter(Boolean) : [];
+      let replyToId = data.replyToId ? Number(data.replyToId) : null;
+
+      if (perms) {
+        const need = capabilityFor(data.messageType);
+        const labels = { text: "send text messages", voice: "send voice messages", media: "share media or files", poll_create: "create polls" };
+        if (!perms.can?.[need]) return reject(`You are not allowed to ${labels[need]} in this chat.`);
+        if (replyToId && !perms.can?.reply) return reject("Replying is turned off in this chat.");
+        if (mentions.length && !perms.can?.mention) return reject("Mentions are turned off in this chat.");
+
+        const maxBytes = (perms.max_file_mb ?? 20) * 1024 * 1024;
+        if (data.fileSize && Number(data.fileSize) > maxBytes) return reject(`Files must be under ${perms.max_file_mb} MB.`);
+      }
+
+      // a reply must point at a message of the same conversation; mentions must be members
+      if (replyToId) {
+        const [ok] = await db.query("SELECT id FROM messages WHERE id=? AND conversation_id=?", [replyToId, data.conversationId]);
+        if (!ok.length) replyToId = null;
+      }
+      if (mentions.length) {
+        const [mem] = await db.query(
+          "SELECT user_id FROM conversation_members WHERE conversation_id=? AND user_id IN (?)",
+          [data.conversationId, mentions]
+        );
+        mentions = mem.map((m) => Number(m.user_id));
+      }
+
+      const baseCols = "conversation_id, sender_id, content, message_type, file_url, file_name, file_size, duration_sec";
+      const baseVals = [
+        data.conversationId,
+        userId,                                   // always from verified socket user
+        data.content ?? null,
+        data.messageType ?? "text",
+        data.fileUrl ?? null,
+        data.fileName ?? null,
+        data.fileSize ?? null,
+        data.durationSec ?? null,
+      ];
+
+      const [r] = HAS_CHAT_COLS
+        ? await db.query(
+            `INSERT INTO messages (${baseCols}, reply_to_id, mentions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [...baseVals, replyToId, mentions.length ? JSON.stringify(mentions) : null]
+          )
+        : await db.query(
+            `INSERT INTO messages (${baseCols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            baseVals
+          );
 
 
      const messageId = r.insertId;
@@ -580,6 +669,8 @@ io.on("connection", async (socket) => {
         file_name: data.fileName ?? null,
         file_size: data.fileSize ?? null,
         duration_sec: data.durationSec ?? null,
+        reply_to_id: replyToId,
+        mentions,
         status: "sent",
         created_at: new Date().toISOString(),
       };
